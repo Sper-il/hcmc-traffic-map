@@ -43,7 +43,9 @@ ox.settings.log_console = False
 
 # Tạo thư mục cache nếu chưa tồn tại
 CACHE_DIR = "map_cache"
+MAP_CACHE_DIR = os.path.join(CACHE_DIR, "folium_maps")
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(MAP_CACHE_DIR, exist_ok=True)
 
 # Danh sách gợi ý sẵn
 DISTRICTS = {
@@ -74,6 +76,7 @@ DISTRICTS = {
 
 # Biến toàn cục để cache trong bộ nhớ (tránh đọc file nhiều lần)
 _MEMORY_CACHE = {}
+_FOLIUM_MAP_CACHE = {}  # Cache cho bản đồ Folium
 _PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL  # Sử dụng protocol cao nhất cho tốc độ tốt nhất
 
 # Hằng số cho tính toán nhanh
@@ -171,6 +174,15 @@ class CacheManager:
         return hashlib.md5(cache_string.encode()).hexdigest()
 
     @staticmethod
+    def get_folium_cache_key(place_name, detailed=False, edges_hash=None):
+        """Tạo key cache cho bản đồ Folium"""
+        if edges_hash:
+            cache_string = f"folium_{place_name}_{detailed}_{edges_hash}"
+        else:
+            cache_string = f"folium_{place_name}_{detailed}"
+        return hashlib.md5(cache_string.encode()).hexdigest()
+
+    @staticmethod
     def get_cache_info_path():
         """Lấy đường dẫn file thông tin cache"""
         return os.path.join(CACHE_DIR, "cache_info.json")
@@ -182,6 +194,11 @@ class CacheManager:
             return os.path.join(CACHE_DIR, f"{cache_key}.pkl.gz")
         else:
             return os.path.join(CACHE_DIR, f"{cache_key}.pkl")
+
+    @staticmethod
+    def get_folium_cache_path(cache_key):
+        """Lấy đường dẫn file cache bản đồ Folium"""
+        return os.path.join(MAP_CACHE_DIR, f"{cache_key}.html")
 
     @staticmethod
     def get_metadata_file_path(cache_key):
@@ -222,6 +239,21 @@ class CacheManager:
             created_time = datetime.fromisoformat(metadata.get('created_at', '2000-01-01'))
             age = datetime.now() - created_time
 
+            return age.days < max_age_days
+        except:
+            return False
+
+    @staticmethod
+    def is_folium_cache_valid(cache_key, max_age_days=30):
+        """Kiểm tra cache bản đồ Folium còn hợp lệ không"""
+        cache_path = CacheManager.get_folium_cache_path(cache_key)
+        if not os.path.exists(cache_path):
+            return False
+
+        try:
+            # Kiểm tra thời gian sửa đổi file
+            mod_time = datetime.fromtimestamp(os.path.getmtime(cache_path))
+            age = datetime.now() - mod_time
             return age.days < max_age_days
         except:
             return False
@@ -299,6 +331,61 @@ class CacheManager:
         except Exception as e:
             st.warning(f"⚠️ Lỗi khi đọc cache: {e}")
             return None
+
+    @staticmethod
+    def save_folium_map(cache_key, folium_map):
+        """Lưu bản đồ Folium dưới dạng HTML"""
+        try:
+            cache_path = CacheManager.get_folium_cache_path(cache_key)
+            folium_map.save(cache_path)
+
+            # Lưu metadata nhỏ
+            meta_path = os.path.join(MAP_CACHE_DIR, f"{cache_key}_meta.json")
+            metadata = {
+                'created_at': datetime.now().isoformat(),
+                'size_kb': os.path.getsize(cache_path) / 1024
+            }
+            with open(meta_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+            return True
+        except Exception as e:
+            st.warning(f"⚠️ Lỗi khi lưu bản đồ: {e}")
+            return False
+
+    @staticmethod
+    def load_folium_map(cache_key):
+        """Tải bản đồ Folium từ cache HTML"""
+        try:
+            cache_path = CacheManager.get_folium_cache_path(cache_key)
+
+            if not os.path.exists(cache_path):
+                return None
+
+            # Đọc nội dung HTML
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+
+            return html_content
+        except Exception as e:
+            st.warning(f"⚠️ Lỗi khi đọc bản đồ: {e}")
+            return None
+
+    @staticmethod
+    def get_edges_hash(edges):
+        """Tạo hash cho edges để xác định xem bản đồ có cần vẽ lại không"""
+        if edges is None or edges.empty:
+            return "empty"
+
+        # Tạo hash từ các thuộc tính cơ bản của edges
+        hash_data = {
+            'shape': edges.shape,
+            'total_length': edges.attrs.get('total_length_km', 0) if hasattr(edges, 'attrs') else 0,
+            'columns': list(edges.columns) if hasattr(edges, 'columns') else [],
+            'count': len(edges)
+        }
+
+        return hashlib.md5(json.dumps(hash_data, sort_keys=True).encode()).hexdigest()
 
 
 def get_graph_data(place_name, detailed=False):
@@ -417,6 +504,7 @@ def download_and_cache_data(place_name, detailed, cache_key, compressed=True):
 class HCMTrafficMap:
     def __init__(self):
         self.cache_info = CacheManager.load_cache_info()
+        self.current_edges_hash = None
 
     def create_sidebar(self):
         st.sidebar.title("⚙️ Tùy Chọn")
@@ -426,15 +514,19 @@ class HCMTrafficMap:
 
         # Thêm nút xóa cache
         st.sidebar.markdown("---")
-        col1, col2 = st.sidebar.columns(2)
+        col1, col2, col3 = st.sidebar.columns(3)
 
         with col1:
-            if st.button("🗑️ Xóa tất cả cache", help="Xóa tất cả dữ liệu đã lưu để tải lại từ đầu"):
+            if st.button("🗑️ Xóa cache", help="Xóa tất cả dữ liệu đã lưu để tải lại từ đầu"):
                 self.clear_all_cache()
 
         with col2:
-            if st.button("🗑️ Xóa cache Quận 1", help="Chỉ xóa cache của Quận 1"):
+            if st.button("🗑️ Cache Q1", help="Chỉ xóa cache của Quận 1"):
                 self.clear_district1_cache()
+
+        with col3:
+            if st.button("🗑️ Bản đồ", help="Xóa cache bản đồ Folium"):
+                self.clear_folium_cache()
 
         # Thêm tùy chọn chi tiết cho Quận 1
         st.sidebar.markdown("---")
@@ -458,6 +550,14 @@ class HCMTrafficMap:
             )
             if self.detailed_mode:
                 st.sidebar.caption("⚠️ Chế độ chi tiết có thể tải chậm hơn do có nhiều đường")
+
+        # Tùy chọn tải lại bản đồ
+        st.sidebar.markdown("---")
+        self.force_reload = st.sidebar.checkbox(
+            "🔄 Tải lại bản đồ",
+            value=False,
+            help="Buộc tải lại bản đồ từ đầu (bỏ qua cache bản đồ)"
+        )
 
         # Xử lý logic chọn
         if selection == "🔍 Nhập địa điểm tùy chỉnh...":
@@ -489,10 +589,21 @@ class HCMTrafficMap:
         total_length = sum(info.get('total_length_km', 0) for info in self.cache_info.values())
         compressed_count = sum(1 for info in self.cache_info.values() if info.get('compressed', False))
 
+        # Đếm file cache bản đồ
+        folium_cache_count = 0
+        folium_cache_size = 0
+        if os.path.exists(MAP_CACHE_DIR):
+            folium_files = [f for f in os.listdir(MAP_CACHE_DIR) if f.endswith('.html')]
+            folium_cache_count = len(folium_files)
+            for file in folium_files:
+                folium_cache_size += os.path.getsize(os.path.join(MAP_CACHE_DIR, file)) / 1024
+
         st.sidebar.markdown(f"### 📊 Thông tin Cache")
         st.sidebar.markdown(f"**Số khu vực:** {len(self.cache_info)}")
+        st.sidebar.markdown(f"**Số bản đồ:** {folium_cache_count}")
         st.sidebar.markdown(f"**Đã nén:** {compressed_count}/{len(self.cache_info)}")
-        st.sidebar.markdown(f"**Tổng dung lượng:** {total_size:.1f} KB")
+        st.sidebar.markdown(f"**Dung lượng dữ liệu:** {total_size:.1f} KB")
+        st.sidebar.markdown(f"**Dung lượng bản đồ:** {folium_cache_size:.1f} KB")
         st.sidebar.markdown(f"**Tổng chiều dài:** {total_length:.1f} km")
 
         # Hiển thị danh sách cache
@@ -519,8 +630,9 @@ class HCMTrafficMap:
         """Xóa tất cả file cache trong thư mục cache"""
         try:
             # Xóa cache trong bộ nhớ
-            global _MEMORY_CACHE
+            global _MEMORY_CACHE, _FOLIUM_MAP_CACHE
             _MEMORY_CACHE.clear()
+            _FOLIUM_MAP_CACHE.clear()
 
             # Xóa file cache
             cache_files = [f for f in os.listdir(CACHE_DIR) if f.endswith(('.pkl', '.json', '.gz'))]
@@ -532,6 +644,16 @@ class HCMTrafficMap:
                     deleted_count += 1
                 except:
                     pass
+
+            # Xóa cache bản đồ
+            if os.path.exists(MAP_CACHE_DIR):
+                map_files = [f for f in os.listdir(MAP_CACHE_DIR) if f.endswith(('.html', '.json'))]
+                for file in map_files:
+                    try:
+                        os.remove(os.path.join(MAP_CACHE_DIR, file))
+                        deleted_count += 1
+                    except:
+                        pass
 
             # Xóa cache info
             CacheManager.save_cache_info({})
@@ -550,10 +672,14 @@ class HCMTrafficMap:
             district1_detailed = CacheManager.get_cache_key("District 1, Ho Chi Minh City, Vietnam", detailed=True)
 
             # Xóa từ cache bộ nhớ
-            global _MEMORY_CACHE
+            global _MEMORY_CACHE, _FOLIUM_MAP_CACHE
             for key in [district1_normal, district1_detailed]:
                 if key in _MEMORY_CACHE:
                     del _MEMORY_CACHE[key]
+                # Xóa cache bản đồ liên quan
+                folium_keys = [k for k in _FOLIUM_MAP_CACHE.keys() if key in k]
+                for f_key in folium_keys:
+                    del _FOLIUM_MAP_CACHE[f_key]
 
             # Xóa file cache
             cache_files = os.listdir(CACHE_DIR)
@@ -563,6 +689,18 @@ class HCMTrafficMap:
                 file_path = os.path.join(CACHE_DIR, file)
                 if file.endswith(('.pkl', '.json', '.gz')):
                     # Kiểm tra nếu file thuộc cache Quận 1
+                    if district1_normal in file or district1_detailed in file:
+                        try:
+                            os.remove(file_path)
+                            deleted_count += 1
+                        except:
+                            pass
+
+            # Xóa cache bản đồ
+            if os.path.exists(MAP_CACHE_DIR):
+                map_files = os.listdir(MAP_CACHE_DIR)
+                for file in map_files:
+                    file_path = os.path.join(MAP_CACHE_DIR, file)
                     if district1_normal in file or district1_detailed in file:
                         try:
                             os.remove(file_path)
@@ -582,6 +720,31 @@ class HCMTrafficMap:
 
         except Exception as e:
             st.sidebar.error(f"❌ Lỗi khi xóa cache Quận 1: {e}")
+
+    def clear_folium_cache(self):
+        """Xóa cache bản đồ Folium"""
+        try:
+            global _FOLIUM_MAP_CACHE
+            _FOLIUM_MAP_CACHE.clear()
+
+            if os.path.exists(MAP_CACHE_DIR):
+                map_files = [f for f in os.listdir(MAP_CACHE_DIR) if f.endswith(('.html', '.json'))]
+                deleted_count = 0
+
+                for file in map_files:
+                    try:
+                        os.remove(os.path.join(MAP_CACHE_DIR, file))
+                        deleted_count += 1
+                    except:
+                        pass
+
+                st.sidebar.success(f"✅ Đã xóa {deleted_count} file cache bản đồ")
+                st.rerun()
+            else:
+                st.sidebar.info("ℹ️ Không có cache bản đồ để xóa")
+
+        except Exception as e:
+            st.sidebar.error(f"❌ Lỗi khi xóa cache bản đồ: {e}")
 
     def load_data(self, place_query, display_name, detailed=False):
         try:
@@ -624,6 +787,9 @@ class HCMTrafficMap:
                 # Lưu tổng chiều dài để sử dụng sau
                 edges.attrs['total_length_km'] = total_length_km
 
+                # Lưu hash của edges
+                self.current_edges_hash = CacheManager.get_edges_hash(edges)
+
             return edges
 
         except Exception as e:
@@ -632,7 +798,53 @@ class HCMTrafficMap:
             st.info("💡 Lỗi này xảy ra khi OpenStreetMap không nhận ra tên bạn gõ. Hãy thử gõ tiếng Anh không dấu nhé!")
             return None
 
-    def create_map(self, edges):
+    def create_map(self, edges, place_query, display_name, detailed=False, force_reload=False):
+        """Tạo bản đồ Folium, sử dụng cache nếu có"""
+
+        # Tạo cache key cho bản đồ
+        folium_cache_key = CacheManager.get_folium_cache_key(
+            place_query,
+            detailed,
+            self.current_edges_hash
+        )
+
+        # Kiểm tra cache bản đồ trong bộ nhớ
+        global _FOLIUM_MAP_CACHE
+        if not force_reload and folium_cache_key in _FOLIUM_MAP_CACHE:
+            st.info(f"⚡ Đang tải bản đồ từ bộ nhớ...")
+            return _FOLIUM_MAP_CACHE[folium_cache_key]
+
+        # Kiểm tra cache bản đồ trên đĩa
+        if not force_reload and CacheManager.is_folium_cache_valid(folium_cache_key):
+            try:
+                with st.spinner("🚀 Đang tải bản đồ từ cache (rất nhanh)..."):
+                    html_content = CacheManager.load_folium_map(folium_cache_key)
+                    if html_content:
+                        # Tạo đối tượng folium map từ HTML
+                        m = folium.Map(location=[10.7769, 106.7009], zoom_start=14)
+                        # Lưu HTML vào cache bộ nhớ
+                        _FOLIUM_MAP_CACHE[folium_cache_key] = m
+                        m._html = html_content  # Lưu HTML để hiển thị sau
+
+                        # Lấy thông tin kích thước từ metadata
+                        meta_path = os.path.join(MAP_CACHE_DIR, f"{folium_cache_key}_meta.json")
+                        if os.path.exists(meta_path):
+                            with open(meta_path, 'r', encoding='utf-8') as f:
+                                metadata = json.load(f)
+                                m.cache_size_kb = metadata.get('size_kb', 0)
+                        else:
+                            m.cache_size_kb = 0
+
+                        st.success(f"✅ Đã tải bản đồ từ cache ({m.cache_size_kb:.1f} KB)")
+                        return m
+            except Exception as e:
+                st.warning(f"⚠️ Lỗi khi đọc cache bản đồ: {e}. Đang tạo bản đồ mới...")
+
+        # Nếu không có cache hợp lệ, tạo bản đồ mới
+        return self._create_new_map(edges, place_query, display_name, detailed, folium_cache_key)
+
+    def _create_new_map(self, edges, place_query, display_name, detailed, folium_cache_key):
+        """Tạo bản đồ mới và lưu vào cache"""
         # Tính tâm bản đồ
         if not edges.empty:
             bounds = edges.total_bounds
@@ -656,9 +868,13 @@ class HCMTrafficMap:
         max_edges = 50000  # Tăng giới hạn cho chế độ chi tiết
         total_displayed_length = 0.0
 
+        # Sử dụng progress bar để hiển thị tiến trình vẽ
+        progress_bar = st.progress(0)
+        total_edges = min(len(edges), max_edges)
+
         # Vẽ các tuyến đường với tối ưu hóa
         for idx, row in edges.iterrows():
-            if count > max_edges:
+            if count >= max_edges:
                 break
             try:
                 hw = row.get('highway')
@@ -711,11 +927,15 @@ class HCMTrafficMap:
                     ).add_to(m)
                     count += 1
 
-                    # Tối ưu: vẽ theo batch nếu có nhiều đường
-                    if count % 1000 == 0:
-                        st.text(f"Đã vẽ {count} đường...")
+                    # Cập nhật progress bar mỗi 1000 đường
+                    if count % 1000 == 0 or count == total_edges:
+                        progress = count / total_edges
+                        progress_bar.progress(progress)
+
             except Exception:
                 continue
+
+        progress_bar.empty()  # Ẩn progress bar sau khi hoàn thành
 
         # Thêm marker cho trung tâm thành phố nếu là Quận 1
         if "District 1" in str(edges.crs) if edges.crs else False:
@@ -739,6 +959,12 @@ class HCMTrafficMap:
         m.total_displayed_length_km = total_displayed_length / 1000
         m.total_displayed_edges = count
 
+        # Lưu bản đồ vào cache
+        if CacheManager.save_folium_map(folium_cache_key, m):
+            st.info(f"💾 Đã lưu bản đồ vào cache")
+            # Lưu vào cache bộ nhớ
+            _FOLIUM_MAP_CACHE[folium_cache_key] = m
+
         return m
 
 
@@ -752,6 +978,7 @@ def main():
     st.sidebar.caption("• Cache nén GZIP")
     st.sidebar.caption("• Parallel processing")
     st.sidebar.caption("• Memory caching")
+    st.sidebar.caption("• Cache bản đồ Folium")
 
     app = HCMTrafficMap()
 
@@ -762,13 +989,25 @@ def main():
     if place_query:
         edges = app.load_data(place_query, display_name, detailed_mode)
         if edges is not None:
-            traffic_map = app.create_map(edges)
-            st_folium(traffic_map, width=1400, height=700, returned_objects=[])
+            traffic_map = app.create_map(edges, place_query, display_name, detailed_mode, app.force_reload)
+
+            # Kiểm tra nếu bản đồ có HTML cache
+            if hasattr(traffic_map, '_html'):
+                # Hiển thị HTML cache
+                st.components.v1.html(traffic_map._html, width=1400, height=700)
+            else:
+                # Hiển thị bản đồ thông thường
+                st_folium(traffic_map, width=1400, height=700, returned_objects=[])
 
             # Lấy thông tin tổng chiều dài từ edges
             total_length_km = edges.attrs.get('total_length_km', 0)
             displayed_length_km = getattr(traffic_map, 'total_displayed_length_km', 0)
             displayed_edges = getattr(traffic_map, 'total_displayed_edges', 0)
+
+            # Thông tin cache bản đồ
+            if hasattr(traffic_map, 'cache_size_kb'):
+                st.sidebar.markdown("---")
+                st.sidebar.markdown(f"**📁 Cache bản đồ:** {traffic_map.cache_size_kb:.1f} KB")
 
             # Cảnh báo khi đang ở chế độ tải nặng
             if "Toàn Thành Phố" in display_name:
@@ -800,6 +1039,21 @@ def main():
                 - Hiển thị thông tin chi tiết khi click vào từng đường (bao gồm chiều dài thực tế)
                 - Tổng chiều dài đường: {total_length_km:.1f} km
                 """)
+
+            # Nút tải bản đồ về máy
+            st.sidebar.markdown("---")
+            if st.sidebar.button("💾 Tải bản đồ về máy"):
+                # Tạo tên file an toàn
+                safe_name = "".join(c for c in display_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                file_name = f"map_{safe_name}.html"
+                file_path = os.path.join(CACHE_DIR, file_name)
+
+                try:
+                    traffic_map.save(file_path)
+                    st.sidebar.success(f"✅ Đã lưu: {file_name}")
+                    st.sidebar.info(f"📁 Vị trí: {os.path.abspath(file_path)}")
+                except Exception as e:
+                    st.sidebar.error(f"❌ Lỗi: {e}")
 
 
 if __name__ == "__main__":
